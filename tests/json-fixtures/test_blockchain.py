@@ -1,38 +1,32 @@
-import pytest
-
 import os
-
+import pytest
 import rlp
 
-from evm.db import (
-    get_db_backend,
-)
-
-from evm import (
-    MainnetChain,
-)
-from evm.db.chain import BaseChainDB
-from evm.exceptions import (
+from eth_utils import (
+    to_tuple,
     ValidationError,
 )
-from evm.vm.forks import (
-    EIP150VM,
-    FrontierVM,
-    HomesteadVM as BaseHomesteadVM,
-    SpuriousDragonVM,
-    ByzantiumVM,
-)
-from evm.rlp.headers import (
+
+from eth.rlp.headers import (
     BlockHeader,
 )
 
-from evm.utils.fixture_tests import (
-    load_fixture,
-    generate_fixture_tests,
-    filter_fixtures,
+from eth.tools.rlp import (
+    assert_imported_genesis_header_unchanged,
+    assert_mined_block_unchanged,
+)
+from eth.tools._utils.normalization import (
     normalize_blockchain_fixtures,
-    verify_state_db,
-    assert_rlp_equal,
+)
+from eth.tools.fixtures import (
+    apply_fixture_block_to_chain,
+    filter_fixtures,
+    generate_fixture_tests,
+    genesis_params_from_fixture,
+    load_fixture,
+    new_chain_from_fixture,
+    should_run_slow_tests,
+    verify_state,
 )
 
 
@@ -42,40 +36,210 @@ ROOT_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 BASE_FIXTURE_PATH = os.path.join(ROOT_PROJECT_DIR, 'fixtures', 'BlockchainTests')
 
 
-def blockchain_fixture_mark_fn(fixture_path, fixture_name):
-    if fixture_path.startswith('GeneralStateTests'):
-        return pytest.mark.skip(
-            "General state tests are also exported as blockchain tests.  We "
-            "skip them here so we don't run them twice"
-        )
-    elif fixture_path.startswith('bcExploitTest'):
+# These are the slowest tests from the full blockchain test run. This list
+# should be regenerated occasionally using `--durations 100` - preferably
+# several runs, using top N percentile to populate the list incrementally.
+# Then sort alphabetically, to reduce churn (lines just being pushed up/down).
+SLOWEST_TESTS = {
+    ('GeneralStateTests/stAttackTest/ContractCreationSpam.json', 'ContractCreationSpam_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCallCreateCallCodeTest/Call1024BalanceTooLow.json', 'Call1024BalanceTooLow_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCallCreateCallCodeTest/Call1024PreCalls.json', 'Call1024PreCalls_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCallCreateCallCodeTest/Call1024PreCalls.json', 'Call1024PreCalls_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCallCreateCallCodeTest/CallRecursiveBombPreCall.json', 'CallRecursiveBombPreCall_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCallCreateCallCodeTest/Callcode1024BalanceTooLow.json', 'Callcode1024BalanceTooLow_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stChangedEIP150/Call1024BalanceTooLow.json', 'Call1024BalanceTooLow_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stChangedEIP150/Call1024PreCalls.json', 'Call1024PreCalls_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stChangedEIP150/Call1024PreCalls.json', 'Call1024PreCalls_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stChangedEIP150/Callcode1024BalanceTooLow.json', 'Callcode1024BalanceTooLow_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCreate2/Create2OnDepth1024.json', 'Create2OnDepth1024_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCreate2/Create2Recursive.json', 'Create2Recursive_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stCreate2/Create2Recursive.json', 'Create2Recursive_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stDelegatecallTestHomestead/Call1024BalanceTooLow.json', 'Call1024BalanceTooLow_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stDelegatecallTestHomestead/Call1024PreCalls.json', 'Call1024PreCalls_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stDelegatecallTestHomestead/Call1024PreCalls.json', 'Call1024PreCalls_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stDelegatecallTestHomestead/Delegatecall1024.json', 'Delegatecall1024_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRandom/randomStatetest48.json', 'randomStatetest48_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRandom2/randomStatetest458.json', 'randomStatetest458_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRandom2/randomStatetest467.json', 'randomStatetest467_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRandom2/randomStatetest636.json', 'randomStatetest636_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRandom2/randomStatetest639.json', 'randomStatetest639_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRecursiveCreate/recursiveCreateReturnValue.json', 'recursiveCreateReturnValue_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/LoopCallsDepthThenRevert2.json', 'LoopCallsDepthThenRevert2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/LoopCallsDepthThenRevert3.json', 'LoopCallsDepthThenRevert3_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/LoopCallsThenRevert.json', 'LoopCallsThenRevert_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/LoopCallsThenRevert.json', 'LoopCallsThenRevert_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stShift/shiftCombinations.json', 'shiftCombinations_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024BalanceTooLow.json', 'static_Call1024BalanceTooLow_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024BalanceTooLow2.json', 'static_Call1024BalanceTooLow2_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024PreCalls.json', 'static_Call1024PreCalls_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024PreCalls2.json', 'static_Call1024PreCalls2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024PreCalls2.json', 'static_Call1024PreCalls2_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1024PreCalls3.json', 'static_Call1024PreCalls3_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call1MB1024Calldepth.json', 'static_Call1MB1024Calldepth_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000.json', 'static_Call50000_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000.json', 'static_Call50000_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_ecrec.json', 'static_Call50000_ecrec_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_ecrec.json', 'static_Call50000_ecrec_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_identity.json', 'static_Call50000_identity_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_identity.json', 'static_Call50000_identity_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_identity2.json', 'static_Call50000_identity2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_identity2.json', 'static_Call50000_identity2_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_rip160.json', 'static_Call50000_rip160_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000_rip160.json', 'static_Call50000_rip160_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000bytesContract50_1.json', 'static_Call50000bytesContract50_1_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000bytesContract50_1.json', 'static_Call50000bytesContract50_1_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000bytesContract50_2.json', 'static_Call50000bytesContract50_2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Call50000bytesContract50_2.json', 'static_Call50000bytesContract50_2_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_LoopCallsDepthThenRevert2.json', 'static_LoopCallsDepthThenRevert2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_LoopCallsDepthThenRevert3.json', 'static_LoopCallsDepthThenRevert3_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_LoopCallsThenRevert.json', 'static_LoopCallsThenRevert_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_LoopCallsThenRevert.json', 'static_LoopCallsThenRevert_d0g1v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stStaticCall/static_Return50000_2.json', 'static_Return50000_2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stSystemOperationsTest/CallRecursiveBomb0_OOG_atMaxCallDepth.json', 'CallRecursiveBomb0_OOG_atMaxCallDepth_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stTimeConsuming/CALLBlake2f_MaxRounds.json', 'CALLBlake2f_MaxRounds_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stTimeConsuming/static_Call50000_sha256.json', 'static_Call50000_sha256_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stTimeConsuming/static_Call50000_sha256.json', 'static_Call50000_sha256_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_one_point_fail.json', 'ecpairing_one_point_fail_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_three_point_fail_1.json', 'ecpairing_three_point_fail_1_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_three_point_match_1.json', 'ecpairing_three_point_match_1_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_three_point_match_1.json', 'ecpairing_three_point_match_1_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_fail_1.json', 'ecpairing_two_point_fail_1_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_fail_2.json', 'ecpairing_two_point_fail_2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_1.json', 'ecpairing_two_point_match_1_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_2.json', 'ecpairing_two_point_match_2_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_2.json', 'ecpairing_two_point_match_2_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_3.json', 'ecpairing_two_point_match_3_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_3.json', 'ecpairing_two_point_match_3_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_4.json', 'ecpairing_two_point_match_4_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_match_4.json', 'ecpairing_two_point_match_4_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_oog.json', 'ecpairing_two_point_oog_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_point_oog.json', 'ecpairing_two_point_oog_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_points_with_one_g2_zero.json', 'ecpairing_two_points_with_one_g2_zero_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/ecpairing_two_points_with_one_g2_zero.json', 'ecpairing_two_points_with_one_g2_zero_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d0g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d1g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d2g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d2g3v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d3g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d4g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d5g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stZeroKnowledge/pairingTest.json', 'pairingTest_d5g3v0_Istanbul'),  # noqa: E501
+    ('InvalidBlocks/bcForgedTest/bcForkBlockTest.json', 'BlockWrongResetGas'),  # noqa: E501
+    ('InvalidBlocks/bcForgedTest/bcInvalidRLPTest.json', 'BLOCK_difficulty_TooLarge'),  # noqa: E501
+    ('InvalidBlocks/bcMultiChainTest/UncleFromSideChain.json', 'UncleFromSideChain_Constantinople'),  # noqa: E501
+    ('TransitionTests/bcHomesteadToDao/DaoTransactions.json', 'DaoTransactions'),  # noqa: E501
+    ('TransitionTests/bcHomesteadToDao/DaoTransactions_UncleExtradata.json', 'DaoTransactions_UncleExtradata'),  # noqa: E501
+    ('ValidBlocks/bcGasPricerTest/RPC_API_Test.json', 'RPC_API_Test_EIP150'),  # noqa: E501
+    ('ValidBlocks/bcGasPricerTest/RPC_API_Test.json', 'RPC_API_Test_EIP158'),  # noqa: E501
+    ('ValidBlocks/bcGasPricerTest/RPC_API_Test.json', 'RPC_API_Test_Frontier'),  # noqa: E501
+    ('ValidBlocks/bcGasPricerTest/RPC_API_Test.json', 'RPC_API_Test_Homestead'),  # noqa: E501
+    ('ValidBlocks/bcRandomBlockhashTest/randomStatetest284BC.json', 'randomStatetest284BC_Byzantium'),  # noqa: E501
+    ('ValidBlocks/bcStateTests/randomStatetest94.json', 'randomStatetest94_Byzantium'),  # noqa: E501
+    ('ValidBlocks/bcStateTests/randomStatetest94.json', 'randomStatetest94_Constantinople'),  # noqa: E501
+    ('ValidBlocks/bcStateTests/randomStatetest94.json', 'randomStatetest94_ConstantinopleFix'),  # noqa: E501
+    ('ValidBlocks/bcStateTests/randomStatetest94.json', 'randomStatetest94_Homestead'),  # noqa: E501
+    ('ValidBlocks/bcStateTests/randomStatetest94.json', 'randomStatetest94_Istanbul'),  # noqa: E501
+}
+
+
+# These are tests that are thought to be incorrect or buggy upstream,
+# at the commit currently checked out in submodule `fixtures`.
+# Ideally, this list should be empty.
+# WHEN ADDING ENTRIES, ALWAYS PROVIDE AN EXPLANATION!
+INCORRECT_UPSTREAM_TESTS = {
+    # The test considers a "synthetic" scenario (the state described there can't
+    # be arrived at using regular consensus rules).
+    # * https://github.com/ethereum/py-evm/pull/1224#issuecomment-418775512
+    # The result is in conflict with the yellow-paper:
+    # * https://github.com/ethereum/py-evm/pull/1224#issuecomment-418800369
+    ('GeneralStateTests/stRevertTest/RevertInCreateInInit_d0g0v0.json', 'RevertInCreateInInit_d0g0v0_Byzantium'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/RevertInCreateInInit_d0g0v0.json', 'RevertInCreateInInit_d0g0v0_Constantinople'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/RevertInCreateInInit_d0g0v0.json', 'RevertInCreateInInit_d0g0v0_ConstantinopleFix'),  # noqa: E501
+    ('GeneralStateTests/stRevertTest/RevertInCreateInInit.json', 'RevertInCreateInInit_d0g0v0_Istanbul'),  # noqa: E501
+
+    # The CREATE2 variant seems to have been derived from the one above - it, too,
+    # has a "synthetic" state, on which py-evm flips.
+    # * https://github.com/ethereum/py-evm/pull/1181#issuecomment-446330609
+    ('GeneralStateTests/stCreate2/RevertInCreateInInitCreate2_d0g0v0.json', 'RevertInCreateInInitCreate2_d0g0v0_Constantinople'),  # noqa: E501
+    ('GeneralStateTests/stCreate2/RevertInCreateInInitCreate2_d0g0v0.json', 'RevertInCreateInInitCreate2_d0g0v0_ConstantinopleFix'),  # noqa: E501
+    ('GeneralStateTests/stCreate2/RevertInCreateInInitCreate2.json', 'RevertInCreateInInitCreate2_d0g0v0_Istanbul'),  # noqa: E501
+
+    # Four variants have been specifically added to test a collision type
+    # like the above; therefore, they fail in the same manner.
+    # * https://github.com/ethereum/py-evm/pull/1579#issuecomment-446591118
+    # Interestingly, d2 passes in Constantinople after a refactor of storage handling,
+    # the same test was already passing in ConstantinopleFix. Since the situation is synthetic,
+    # not much research went into why, yet.
+    ('GeneralStateTests/stSStoreTest/InitCollision_d0g0v0.json', 'InitCollision_d0g0v0_Constantinople'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision_d1g0v0.json', 'InitCollision_d1g0v0_Constantinople'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision_d3g0v0.json', 'InitCollision_d3g0v0_Constantinople'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision_d0g0v0.json', 'InitCollision_d0g0v0_ConstantinopleFix'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision_d1g0v0.json', 'InitCollision_d1g0v0_ConstantinopleFix'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision_d3g0v0.json', 'InitCollision_d3g0v0_ConstantinopleFix'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision.json', 'InitCollision_d0g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision.json', 'InitCollision_d1g0v0_Istanbul'),  # noqa: E501
+    ('GeneralStateTests/stSStoreTest/InitCollision.json', 'InitCollision_d3g0v0_Istanbul'),  # noqa: E501
+}
+
+
+def blockchain_fixture_mark_fn(fixture_path, fixture_name, fixture_fork):
+    fixture_id = (fixture_path, fixture_name)
+
+    if fixture_path.startswith('bcExploitTest'):
         return pytest.mark.skip("Exploit tests are slow")
+    elif fixture_path.startswith('bcForkStressTest/ForkStressTest.json'):
+        return pytest.mark.skip("Fork stress tests are slow.")
     elif fixture_path == 'bcWalletTest/walletReorganizeOwners.json':
-        return pytest.mark.skip("Wallet owner reorganizatio tests are slow")
+        return pytest.mark.skip("Wallet owner reorganization tests are slow")
+    elif fixture_id in INCORRECT_UPSTREAM_TESTS:
+        return pytest.mark.xfail(reason="Listed in INCORRECT_UPSTREAM_TESTS.")
+    elif 'stTransactionTest/zeroSigTransa' in fixture_path:
+        return pytest.mark.skip("EIP-86 not supported.")
+    elif fixture_id in SLOWEST_TESTS:
+        if should_run_slow_tests():
+            return
+        else:
+            return pytest.mark.skip("Skipping slow test")
+    elif 'stQuadraticComplexityTest' in fixture_path:
+        return pytest.mark.skip("Skipping slow test")
 
 
-def blockchain_fixture_ignore_fn(fixture_path, fixture_name):
-    if fixture_path.startswith('GeneralStateTests'):
-        # General state tests are also exported as blockchain tests.  We
-        # skip them here so we don't run them twice"
-        return True
+def generate_ignore_fn_for_fork(passed_fork):
+    if passed_fork:
+        passed_fork = passed_fork.lower()
+
+        def ignore_fn(fixture_path, fixture_key, fixture_fork):
+            return fixture_fork.lower() != passed_fork
+
+        return ignore_fn
+
+
+@to_tuple
+def expand_fixtures_forks(all_fixtures):
+    for fixture_path, fixture_key in all_fixtures:
+        fixture = load_fixture(fixture_path, fixture_key)
+        yield fixture_path, fixture_key, fixture['network']
 
 
 def pytest_generate_tests(metafunc):
+    fork = metafunc.config.getoption('fork')
     generate_fixture_tests(
         metafunc=metafunc,
         base_fixture_path=BASE_FIXTURE_PATH,
+        preprocess_fn=expand_fixtures_forks,
         filter_fn=filter_fixtures(
             fixtures_base_dir=BASE_FIXTURE_PATH,
             mark_fn=blockchain_fixture_mark_fn,
-            ignore_fn=blockchain_fixture_ignore_fn,
+            ignore_fn=generate_ignore_fn_for_fork(fork)
         ),
     )
 
 
 @pytest.fixture
 def fixture(fixture_data):
-    fixture_path, fixture_key = fixture_data
+    fixture_path, fixture_key, fixture_fork = fixture_data
     fixture = load_fixture(
         fixture_path,
         fixture_key,
@@ -84,148 +248,55 @@ def fixture(fixture_data):
     return fixture
 
 
-@pytest.fixture
-def chain_vm_configuration(fixture_data, fixture):
-    network = fixture['network']
+def test_blockchain_fixtures(fixture_data, fixture):
+    try:
+        chain = new_chain_from_fixture(fixture)
+    except ValueError as e:
+        raise AssertionError(f"could not load chain for {fixture_data}") from e
 
-    if network == 'Frontier':
-        return (
-            (0, FrontierVM),
-        )
-    elif network == 'Homestead':
-        HomesteadVM = BaseHomesteadVM.configure(support_dao_fork=False)
-        return (
-            (0, HomesteadVM),
-        )
-    elif network == 'EIP150':
-        return (
-            (0, EIP150VM),
-        )
-    elif network == 'EIP158':
-        return (
-            (0, SpuriousDragonVM),
-        )
-    elif network == 'Byzantium':
-        return (
-            (0, ByzantiumVM),
-        )
-    elif network == 'Constantinople':
-        pytest.skip('Constantinople VM rules not yet supported')
-    elif network == 'FrontierToHomesteadAt5':
-        HomesteadVM = BaseHomesteadVM.configure(support_dao_fork=False)
-        return (
-            (0, FrontierVM),
-            (5, HomesteadVM),
-        )
-    elif network == 'HomesteadToEIP150At5':
-        HomesteadVM = BaseHomesteadVM.configure(support_dao_fork=False)
-        return (
-            (0, HomesteadVM),
-            (5, EIP150VM),
-        )
-    elif network == 'HomesteadToDaoAt5':
-        HomesteadVM = BaseHomesteadVM.configure(
-            support_dao_fork=True,
-            dao_fork_block_number=5,
-        )
-        return (
-            (0, HomesteadVM),
-        )
-    elif network == 'EIP158ToByzantiumAt5':
-        return (
-            (0, SpuriousDragonVM),
-            (5, ByzantiumVM),
-        )
-    else:
-        fixture_path, fixture_key = fixture_data
-        raise AssertionError(
-            "Test fixture did not match any configuration rules: {0}:{1}".format(
-                fixture_path,
-                fixture_key,
-            )
-        )
-
-
-def test_blockchain_fixtures(fixture, chain_vm_configuration):
-    genesis_params = {
-        'parent_hash': fixture['genesisBlockHeader']['parentHash'],
-        'uncles_hash': fixture['genesisBlockHeader']['uncleHash'],
-        'coinbase': fixture['genesisBlockHeader']['coinbase'],
-        'state_root': fixture['genesisBlockHeader']['stateRoot'],
-        'transaction_root': fixture['genesisBlockHeader']['transactionsTrie'],
-        'receipt_root': fixture['genesisBlockHeader']['receiptTrie'],
-        'bloom': fixture['genesisBlockHeader']['bloom'],
-        'difficulty': fixture['genesisBlockHeader']['difficulty'],
-        'block_number': fixture['genesisBlockHeader']['number'],
-        'gas_limit': fixture['genesisBlockHeader']['gasLimit'],
-        'gas_used': fixture['genesisBlockHeader']['gasUsed'],
-        'timestamp': fixture['genesisBlockHeader']['timestamp'],
-        'extra_data': fixture['genesisBlockHeader']['extraData'],
-        'mix_hash': fixture['genesisBlockHeader']['mixHash'],
-        'nonce': fixture['genesisBlockHeader']['nonce'],
-    }
+    genesis_params = genesis_params_from_fixture(fixture)
     expected_genesis_header = BlockHeader(**genesis_params)
 
     # TODO: find out if this is supposed to pass?
     # if 'genesisRLP' in fixture:
     #     assert rlp.encode(genesis_header) == fixture['genesisRLP']
-    db = BaseChainDB(get_db_backend())
-
-    ChainForTesting = MainnetChain.configure(
-        'ChainForTesting',
-        vm_configuration=chain_vm_configuration,
-    )
-
-    chain = ChainForTesting.from_genesis(
-        db,
-        genesis_params=genesis_params,
-        genesis_state=fixture['pre'],
-    )
 
     genesis_block = chain.get_canonical_block_by_number(0)
     genesis_header = genesis_block.header
 
-    assert_rlp_equal(genesis_header, expected_genesis_header)
+    assert_imported_genesis_header_unchanged(expected_genesis_header, genesis_header)
 
     # 1 - mine the genesis block
     # 2 - loop over blocks:
     #     - apply transactions
     #     - mine block
-    # 4 - profit!!
+    # 3 - diff resulting state with expected state
+    # 4 - check that all previous blocks were valid
 
-    for block_data in fixture['blocks']:
-        should_be_good_block = 'blockHeader' in block_data
+    for block_fixture in fixture['blocks']:
+        should_be_good_block = 'blockHeader' in block_fixture
 
-        if 'rlp_error' in block_data:
+        if 'rlp_error' in block_fixture:
             assert not should_be_good_block
             continue
 
-        # The block to import may be in a different block-class-range than the
-        # chain's current one, so we use the block number specified in the
-        # fixture to look up the correct block class.
         if should_be_good_block:
-            block_number = block_data['blockHeader']['number']
-            block_class = chain.get_vm_class_for_block_number(block_number).get_block_class()
+            (block, mined_block, block_rlp) = apply_fixture_block_to_chain(
+                block_fixture,
+                chain,
+                perform_validation=False  # we manually validate below
+            )
+            assert_mined_block_unchanged(block, mined_block)
+            chain.validate_block(block)
         else:
-            block_class = chain.get_vm().get_block_class()
-
-        try:
-            block = rlp.decode(block_data['rlp'], sedes=block_class, chaindb=chain.chaindb)
-        except (TypeError, rlp.DecodingError, rlp.DeserializationError) as err:
-            assert not should_be_good_block, "Block should be good: {0}".format(err)
-            continue
-
-        try:
-            mined_block = chain.import_block(block)
-        except ValidationError as err:
-            assert not should_be_good_block, "Block should be good: {0}".format(err)
-            continue
-        else:
-            assert_rlp_equal(mined_block, block)
-            assert should_be_good_block, "Block should have caused a validation error"
+            try:
+                apply_fixture_block_to_chain(block_fixture, chain)
+            except (TypeError, rlp.DecodingError, rlp.DeserializationError, ValidationError) as err:
+                # failure is expected on this bad block
+                pass
+            else:
+                raise AssertionError("Block should have caused a validation error")
 
     latest_block_hash = chain.get_canonical_block_by_number(chain.get_block().number - 1).hash
-    assert latest_block_hash == fixture['lastblockhash']
-
-    with chain.get_vm().state_db(read_only=True) as state_db:
-        verify_state_db(fixture['postState'], state_db)
+    if latest_block_hash != fixture['lastblockhash']:
+        verify_state(fixture['postState'], chain.get_vm().state)

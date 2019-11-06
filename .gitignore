@@ -16,6 +16,7 @@ develop-eggs
 .installed.cfg
 lib
 lib64
+pip-wheel-metadata
 
 # Installer logs
 pip-log.txt
@@ -43,9 +44,10 @@ docs/modules.rst
 
 # pytest
 .cache/
+.pytest_cache/
 
 # fixtures
-fixtures/**
+./fixtures/**
 
 # profiling
 prof/**
@@ -59,3 +61,15 @@ prof/**
 docs/evm.*rst
 venv*
 .eggs/
+
+# vscode
+.vscode/**
+
+# monkeytype
+monkeytype.sqlite3
+
+# pyenv
+.python-version
+
+# idea
+.idea/**

@@ -2,42 +2,52 @@ import os
 
 import pytest
 
-from evm.db import (
+from eth_utils import (
+    to_bytes,
+)
+
+from eth.db import (
     get_db_backend,
 )
-from evm.db.chain import BaseChainDB
+from eth.db.chain import ChainDB
 
-from eth_utils import (
-    keccak,
-)
+from eth_hash.auto import keccak
 
-from evm.exceptions import (
+from eth.exceptions import (
     VMError,
 )
-from evm.rlp.headers import (
+from eth.rlp.headers import (
     BlockHeader,
 )
-from evm.vm.forks import (
-    HomesteadVM,
-)
-from evm.vm import (
-    Message,
-    Computation,
-)
-
-from evm.utils.fixture_tests import (
-    normalize_vmtest_fixture,
+from eth.tools.fixtures import (
+    filter_fixtures,
     generate_fixture_tests,
     load_fixture,
-    filter_fixtures,
-    setup_state_db,
-    verify_state_db,
+    setup_state,
+    verify_state,
+)
+from eth.tools._utils.normalization import (
+    normalize_vmtest_fixture,
+)
+from eth.tools._utils.hashing import (
     hash_log_entries,
 )
-
+from eth.vm.chain_context import ChainContext
+from eth.vm.forks import (
+    HomesteadVM,
+)
+from eth.vm.forks.homestead.computation import (
+    HomesteadComputation,
+)
+from eth.vm.forks.homestead.state import HomesteadState
+from eth.vm.message import (
+    Message,
+)
+from eth.vm.transaction_context import (
+    BaseTransactionContext,
+)
 
 ROOT_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
 
 BASE_FIXTURE_PATH = os.path.join(ROOT_PROJECT_DIR, 'fixtures', 'VMTests')
 
@@ -76,42 +86,42 @@ def fixture(fixture_data):
 #
 # Testing Overrides
 #
-def apply_message_for_testing(self, message):
+def apply_message_for_testing(self):
     """
     For VM tests, we don't actually apply messages.
     """
-    computation = Computation(
-        vm=self,
-        message=message,
-    )
-    return computation
+    return self
 
 
-def apply_create_message_for_testing(self, message):
+def apply_create_message_for_testing(self):
     """
     For VM tests, we don't actually apply messages.
     """
-    computation = Computation(
-        vm=self,
-        message=message,
-    )
-    return computation
+    return self
 
 
 def get_block_hash_for_testing(self, block_number):
-    if block_number >= self.block.header.block_number:
+    if block_number >= self.block_number:
         return b''
-    elif block_number < self.block.header.block_number - 256:
+    elif block_number < self.block_number - 256:
         return b''
     else:
-        return keccak("{0}".format(block_number))
+        return keccak(to_bytes(text=f"{block_number}"))
 
 
-HomesteadVMForTesting = HomesteadVM.configure(
-    name='HomesteadVMForTesting',
-    apply_message=apply_create_message_for_testing,
+HomesteadComputationForTesting = HomesteadComputation.configure(
+    __name__='HomesteadComputationForTesting',
+    apply_message=apply_message_for_testing,
     apply_create_message=apply_create_message_for_testing,
+)
+HomesteadStateForTesting = HomesteadState.configure(
+    __name__='HomesteadStateForTesting',
     get_ancestor_hash=get_block_hash_for_testing,
+    computation_class=HomesteadComputationForTesting,
+)
+HomesteadVMForTesting = HomesteadVM.configure(
+    __name__='HomesteadVMForTesting',
+    _state_class=HomesteadStateForTesting,
 )
 
 
@@ -126,11 +136,51 @@ def vm_class(request):
     elif request.param == 'SpuriousDragon':
         pytest.skip('Only the Homestead VM rules are currently supported')
     else:
-        assert False, "Unsupported VM: {0}".format(request.param)
+        assert False, f"Unsupported VM: {request.param}"
 
 
-def test_vm_fixtures(fixture, vm_class):
-    chaindb = BaseChainDB(get_db_backend())
+def fixture_to_computation(fixture, code, vm):
+    message = Message(
+        to=fixture['exec']['address'],
+        sender=fixture['exec']['caller'],
+        value=fixture['exec']['value'],
+        data=fixture['exec']['data'],
+        code=code,
+        gas=fixture['exec']['gas'],
+    )
+    transaction_context = BaseTransactionContext(
+        origin=fixture['exec']['origin'],
+        gas_price=fixture['exec']['gasPrice'],
+    )
+    return vm.state.get_computation(message, transaction_context).apply_computation(
+        vm.state,
+        message,
+        transaction_context,
+    )
+
+
+def fixture_to_bytecode_computation(fixture, code, vm):
+    return vm.execute_bytecode(
+        origin=fixture['exec']['origin'],
+        gas_price=fixture['exec']['gasPrice'],
+        gas=fixture['exec']['gas'],
+        to=fixture['exec']['address'],
+        sender=fixture['exec']['caller'],
+        value=fixture['exec']['value'],
+        data=fixture['exec']['data'],
+        code=code,
+    )
+
+
+@pytest.mark.parametrize(
+    'computation_getter',
+    (
+        fixture_to_bytecode_computation,
+        fixture_to_computation,
+    ),
+)
+def test_vm_fixtures(fixture, vm_class, computation_getter):
+    chaindb = ChainDB(get_db_backend())
     header = BlockHeader(
         coinbase=fixture['env']['currentCoinbase'],
         difficulty=fixture['env']['currentDifficulty'],
@@ -138,23 +188,40 @@ def test_vm_fixtures(fixture, vm_class):
         gas_limit=fixture['env']['currentGasLimit'],
         timestamp=fixture['env']['currentTimestamp'],
     )
-    vm = vm_class(header=header, chaindb=chaindb)
 
-    with vm.state_db() as state_db:
-        setup_state_db(fixture['pre'], state_db)
-        code = state_db.get_code(fixture['exec']['address'])
+    # None of the VM tests (currently) test chain ID, so the setting doesn't matter here.
+    #   When they *do* start testing ID, they will have to supply it as part of the environment.
+    #   For now, just hard-code it to something not used in practice:
+    chain_context = ChainContext(chain_id=0)
+
+    vm = vm_class(header=header, chaindb=chaindb, chain_context=chain_context)
+    state = vm.state
+    setup_state(fixture['pre'], state)
+    code = state.get_code(fixture['exec']['address'])
+    # Update state_root manually
+    vm._block = vm.get_block().copy(header=vm.get_header().copy(state_root=state.state_root))
 
     message = Message(
-        origin=fixture['exec']['origin'],
         to=fixture['exec']['address'],
         sender=fixture['exec']['caller'],
         value=fixture['exec']['value'],
         data=fixture['exec']['data'],
         code=code,
         gas=fixture['exec']['gas'],
+    )
+    transaction_context = BaseTransactionContext(
+        origin=fixture['exec']['origin'],
         gas_price=fixture['exec']['gasPrice'],
     )
-    computation = vm.apply_computation(message)
+    computation = vm.state.get_computation(message, transaction_context).apply_computation(
+        vm.state,
+        message,
+        transaction_context,
+    )
+    # Update state_root manually
+    vm._block = vm.get_block().copy(
+        header=vm.get_header().copy(state_root=computation.state.state_root),
+    )
 
     if 'post' in fixture:
         #
@@ -168,17 +235,17 @@ def test_vm_fixtures(fixture, vm_class):
             expected_logs_hash = fixture['logs']
             assert expected_logs_hash == actual_logs_hash
         elif log_entries:
-            raise AssertionError("Got log entries: {0}".format(log_entries))
+            raise AssertionError(f"Got log entries: {log_entries}")
 
         expected_output = fixture['out']
         assert computation.output == expected_output
 
-        gas_meter = computation.gas_meter
+        gas_meter = computation._gas_meter
 
         expected_gas_remaining = fixture['gas']
         actual_gas_remaining = gas_meter.gas_remaining
         gas_delta = actual_gas_remaining - expected_gas_remaining
-        assert gas_delta == 0, "Gas difference: {0}".format(gas_delta)
+        assert gas_delta == 0, f"Gas difference: {gas_delta}"
 
         call_creates = fixture.get('callcreates', [])
         assert len(computation.children) == len(call_creates)
@@ -194,14 +261,13 @@ def test_vm_fixtures(fixture, vm_class):
             assert data == child_computation.msg.data or child_computation.msg.code
             assert gas_limit == child_computation.msg.gas
             assert value == child_computation.msg.value
-        post_state = fixture['post']
+        expected_account_db = fixture['post']
     else:
         #
         # Error checks
         #
         assert computation.is_error
         assert isinstance(computation._error, VMError)
-        post_state = fixture['pre']
+        expected_account_db = fixture['pre']
 
-    with vm.state_db(read_only=True) as state_db:
-        verify_state_db(post_state, state_db)
+    verify_state(expected_account_db, vm.state)

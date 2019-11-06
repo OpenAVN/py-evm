@@ -21,10 +21,10 @@ clean-pyc:
 	find . -name '*.pyc' -exec rm -f {} +
 	find . -name '*.pyo' -exec rm -f {} +
 	find . -name '*~' -exec rm -f {} +
+	find . -name '__pycache__' -exec rm -rf {} +
 
 lint:
-	flake8 evm
-	flake8 tests --exclude=""
+	tox -epy3{6,5}-lint
 
 test:
 	py.test --tb native tests
@@ -33,22 +33,54 @@ test-all:
 	tox
 
 coverage:
-	coverage run --source evm
+	coverage run --source eth
 	coverage report -m
 	coverage html
 	open htmlcov/index.html
 
 build-docs:
-	cd docs/; sphinx-build -T -E . _build/html
+	pip install -e .[doc]
+	cd docs/; sphinx-build -W -T -E . _build/html
+
+doctest:
+	cd docs/; sphinx-build -T -b doctest . _build/doctest
+
+validate-docs: build-docs doctest
+	./newsfragments/validate_files.py
+	towncrier --draft
 
 docs: build-docs
 	open docs/_build/html/index.html
 
 linux-docs: build-docs
-	xdg-open docs/_build/html/index.html
+	readlink -f docs/_build/html/index.html
+
+package: clean
+	python setup.py sdist bdist_wheel
+	python scripts/release/test_package.py
+
+notes:
+	# Let UPCOMING_VERSION be the version that is used for the current bump
+	$(eval UPCOMING_VERSION=$(shell bumpversion $(bump) --dry-run --list | grep new_version= | sed 's/new_version=//g'))
+	# Now generate the release notes to have them included in the release commit
+	towncrier --yes --version $(UPCOMING_VERSION)
+	# Before we bump the version, make sure that the towncrier-generated docs will build
+	make build-docs
+	git commit -m "Compile release notes"
 
 release: clean
-	python setup.py sdist bdist_wheel upload
+	# require that you be on a branch that's linked to upstream/master
+	git status -s -b | head -1 | grep "\.\.upstream/master"
+	./newsfragments/validate_files.py is-empty
+	# verify that docs build correctly
+	make build-docs
+	CURRENT_SIGN_SETTING=$(git config commit.gpgSign)
+	git config commit.gpgSign true
+	bumpversion $(bump)
+	git push upstream && git push upstream --tags
+	python setup.py sdist bdist_wheel
+	twine upload dist/*
+	git config commit.gpgSign "$(CURRENT_SIGN_SETTING)"
 
 sdist: clean
 	python setup.py sdist bdist_wheel
