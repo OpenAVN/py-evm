@@ -3,6 +3,93 @@ Release notes
 
 .. towncrier release notes start
 
+py-evm 0.3.0-alpha.11 (2019-12-12)
+----------------------------------
+
+Bugfixes
+~~~~~~~~
+
+- When double-deleting a storage slot, got ``KeyError: (b'\x03', 'key could not be deleted in
+  JournalDB, because it was missing')``. This was fallout from `#1893
+  <https://github.com/ethereum/py-evm/pull/1893>`_ (`#1898 <https://github.com/ethereum/py-evm/issues/1898>`__)
+
+
+Performance improvements
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Improve performance when importing a header which is a child of the current canonical
+  chain tip. (`#1891 <https://github.com/ethereum/py-evm/issues/1891>`__)
+
+
+py-evm 0.3.0-alpha.10 (2019-12-09)
+----------------------------------
+
+Bugfixes
+~~~~~~~~
+
+- Bug: if data was missing during a call to :meth:`~eth.vm.base.VM.apply_all_transactions`,
+  then the call would revert and continue processing transactions. Fix: we re-raise
+  the :class:`~eth.exceptions.EVMMissingData` and do not continue processing transactions. (`#1889 <https://github.com/ethereum/py-evm/issues/1889>`__)
+- Fix for net gas metering (EIP-2200) in Istanbul. The "original value" used to calculate gas
+  costs was incorrectly accessing the value at the start of the block, instead of the start of the
+  transaction. (`#1893 <https://github.com/ethereum/py-evm/issues/1893>`__)
+
+
+Improved Documentation
+~~~~~~~~~~~~~~~~~~~~~~
+
+- Add Matomo Tracking to Docs site.
+
+  Matomo is an Open Source web analytics platform that allows us
+  to get better insights and optimize for our audience without
+  the negative consequences of other compareable platforms.
+
+  Read more: https://matomo.org/why-matomo/ (`#1892 <https://github.com/ethereum/py-evm/issues/1892>`__)
+
+
+py-evm 0.3.0-alpha.9 (2019-12-02)
+---------------------------------
+
+Features
+~~~~~~~~
+
+- Add new Chain APIs (`#1887 <https://github.com/ethereum/py-evm/issues/1887>`__):
+
+  - :meth:`~eth.chains.base.Chain.get_canonical_block_header_by_number` (parallel to :meth:`~eth.chains.base.Chain.get_canonical_block_by_number`)
+  - :meth:`~eth.chains.base.Chain.get_canonical_transaction_index`
+  - :meth:`~eth.chains.base.Chain.get_canonical_transaction_by_index`
+  - :meth:`~eth.chains.base.Chain.get_transaction_receipt_by_index`
+
+
+Bugfixes
+~~~~~~~~
+
+- Remove the ice age delay that was accidentally left in Istanbul (`#1877 <https://github.com/ethereum/py-evm/issues/1877>`__)
+
+
+Improved Documentation
+~~~~~~~~~~~~~~~~~~~~~~
+
+- In the API docs display class methods, static methods and methods as one group "methods".
+  While we ideally wish to separate these, Sphinx keeps them all as one group which we'll
+  be following until we find a better option. (`#794 <https://github.com/ethereum/py-evm/issues/794>`__)
+- Tweak layout of API docs to improve readability
+
+  Group API docs by member (methods, attributes) (`#1797 <https://github.com/ethereum/py-evm/issues/1797>`__)
+- API doc additions (`#1880 <https://github.com/ethereum/py-evm/issues/1880>`__)
+
+  - Add missing API docs for :class:`~eth.chains.base.MiningChain`.
+  - Add missing API docs for :mod:`eth.db.*`
+  - Add missing API docs for :class:`~eth.vm.forks.constantinople.ConstantinopleVM`,
+    :class:`~eth.vm.forks.petersburg.PetersburgVM` and
+    :class:`~eth.vm.forks.istanbul.IstanbulVM` forks
+  - Move all docstrings that aren't overly specific to a particular implementation from
+    the implementation to the interface. This has the effect that the docstring will
+    appear both on the interface as well as on the implementation except for when the
+    implementation overwrites the docstring with a more specific descriptions.
+- Add docstrings to all public APIs that were still lacking one. (`#1882 <https://github.com/ethereum/py-evm/issues/1882>`__)
+
+
 py-evm 0.3.0-alpha.8 (2019-11-05)
 ---------------------------------
 

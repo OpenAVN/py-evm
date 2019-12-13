@@ -149,10 +149,6 @@ class StorageLookup(BaseDB):
 
 
 class AccountStorageDB(AccountStorageDatabaseAPI):
-    """
-    Storage cache and write batch for a single account. Changes are not
-    merklized until :meth:`make_storage_root` is called.
-    """
     logger = get_extended_debug_logger("eth.db.storage.AccountStorageDB")
 
     def __init__(self, db: AtomicDatabaseAPI, storage_root: Hash32, address: Address) -> None:
@@ -161,7 +157,7 @@ class AccountStorageDB(AccountStorageDatabaseAPI):
 
         .. code::
 
-            db -> _storage_lookup -> _storage_cache -> _journal_storage
+            db -> _storage_lookup -> _storage_cache -> _locked_changes -> _journal_storage
 
         db is the raw database, we can assume it hits disk when written to.
         Keys are stored as node hashes and rlp-encoded node values.
@@ -178,6 +174,10 @@ class AccountStorageDB(AccountStorageDatabaseAPI):
         after a state root change. Otherwise, you will see data since the last
         storage root was calculated.
 
+        _locked_changes is a batch database that includes only those values that are
+        un-revertable in the EVM. Currently, that means changes that completed in a
+        previous transaction.
+
         Journaling batches writes at the _journal_storage layer, until persist is called.
         It manages all the checkpointing and rollbacks that happen during EVM execution.
 
@@ -187,11 +187,12 @@ class AccountStorageDB(AccountStorageDatabaseAPI):
         self._address = address
         self._storage_lookup = StorageLookup(db, storage_root, address)
         self._storage_cache = CacheDB(self._storage_lookup)
-        self._journal_storage = JournalDB(self._storage_cache)
+        self._locked_changes = BatchDB(self._storage_cache)
+        self._journal_storage = JournalDB(self._locked_changes)
 
     def get(self, slot: int, from_journal: bool=True) -> int:
         key = int_to_big_endian(slot)
-        lookup_db = self._journal_storage if from_journal else self._storage_cache
+        lookup_db = self._journal_storage if from_journal else self._locked_changes
         try:
             encoded_value = lookup_db[key]
         except MissingStorageTrieNode:
@@ -209,7 +210,15 @@ class AccountStorageDB(AccountStorageDatabaseAPI):
         if value:
             self._journal_storage[key] = rlp.encode(value)
         else:
-            del self._journal_storage[key]
+            try:
+                current_val = self._journal_storage[key]
+            except KeyError:
+                # deleting an empty key has no effect
+                return
+            else:
+                if current_val != b'':
+                    # only try to delete the value if it's present
+                    del self._journal_storage[key]
 
     def delete(self) -> None:
         self.logger.debug2(
@@ -241,11 +250,12 @@ class AccountStorageDB(AccountStorageDatabaseAPI):
             #    then flatten all changes, without persisting
             self._journal_storage.flatten()
 
-    def make_storage_root(self) -> None:
-        """
-        Force calculation of the storage root for this account
-        """
+    def lock_changes(self) -> None:
         self._journal_storage.persist()
+
+    def make_storage_root(self) -> None:
+        self.lock_changes()
+        self._locked_changes.commit(apply_deletes=True)
 
     def _validate_flushed(self) -> None:
         """

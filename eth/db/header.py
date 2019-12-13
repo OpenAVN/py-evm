@@ -1,5 +1,5 @@
 import functools
-from typing import Iterable, Tuple
+from typing import cast, Iterable, Tuple
 
 import rlp
 
@@ -50,12 +50,6 @@ class HeaderDB(HeaderDatabaseAPI):
     # Canonical Chain API
     #
     def get_canonical_block_hash(self, block_number: BlockNumber) -> Hash32:
-        """
-        Returns the block hash for the canonical block at the given number.
-
-        Raises BlockNotFound if there's no block header with the given number in the
-        canonical chain.
-        """
         return self._get_canonical_block_hash(self.db, block_number)
 
     @staticmethod
@@ -73,12 +67,6 @@ class HeaderDB(HeaderDatabaseAPI):
             return rlp.decode(encoded_key, sedes=rlp.sedes.binary)
 
     def get_canonical_block_header_by_number(self, block_number: BlockNumber) -> BlockHeaderAPI:
-        """
-        Returns the block header with the given number in the canonical chain.
-
-        Raises BlockNotFound if there's no block header with the given number in the
-        canonical chain.
-        """
         return self._get_canonical_block_header_by_number(self.db, block_number)
 
     @classmethod
@@ -91,18 +79,19 @@ class HeaderDB(HeaderDatabaseAPI):
         return cls._get_block_header_by_hash(db, canonical_block_hash)
 
     def get_canonical_head(self) -> BlockHeaderAPI:
-        """
-        Returns the current block header at the head of the chain.
-        """
         return self._get_canonical_head(self.db)
 
     @classmethod
     def _get_canonical_head(cls, db: DatabaseAPI) -> BlockHeaderAPI:
+        canonical_head_hash = cls._get_canonical_head_hash(db)
+        return cls._get_block_header_by_hash(db, canonical_head_hash)
+
+    @classmethod
+    def _get_canonical_head_hash(cls, db: DatabaseAPI) -> Hash32:
         try:
-            canonical_head_hash = db[SchemaV1.make_canonical_head_hash_lookup_key()]
+            return Hash32(db[SchemaV1.make_canonical_head_hash_lookup_key()])
         except KeyError:
             raise CanonicalHeadNotFound("No canonical head set for this chain")
-        return cls._get_block_header_by_hash(db, Hash32(canonical_head_hash))
 
     #
     # Header API
@@ -152,23 +141,10 @@ class HeaderDB(HeaderDatabaseAPI):
                              headers: Iterable[BlockHeaderAPI],
                              genesis_parent_hash: Hash32 = GENESIS_PARENT_HASH
                              ) -> Tuple[Tuple[BlockHeaderAPI, ...], Tuple[BlockHeaderAPI, ...]]:
-        """
-        Return two iterable of headers, the first containing the new canonical headers,
-        the second containing the old canonical headers
-
-        :param genesis_parent_hash: *optional* parent hash of the block that is treated as genesis.
-            Providing a ``genesis_parent_hash`` allows storage of headers that aren't (yet)
-            connected back to the true genesis header.
-
-        """
         with self.db.atomic_batch() as db:
             return self._persist_header_chain(db, headers, genesis_parent_hash)
 
     def persist_checkpoint_header(self, header: BlockHeaderAPI, score: int) -> None:
-        """
-        Persist a checkpoint header with a trusted score. Persisting the checkpoint header
-        automatically sets it as the new canonical head.
-        """
         with self.db.atomic_batch() as db:
             return self._persist_checkpoint_header(db, header, score)
 
@@ -201,7 +177,7 @@ class HeaderDB(HeaderDatabaseAPI):
         )
         previous_score = score - header.difficulty
         cls._set_hash_scores_to_db(db, header, previous_score)
-        cls._set_as_canonical_chain_head(db, header.hash, header.parent_hash)
+        cls._set_as_canonical_chain_head(db, header, header.parent_hash)
 
     @classmethod
     def _persist_header_chain(
@@ -254,13 +230,13 @@ class HeaderDB(HeaderDatabaseAPI):
             score = cls._set_hash_scores_to_db(db, curr_chain_head, score)
 
         try:
-            previous_canonical_head = cls._get_canonical_head(db).hash
+            previous_canonical_head = cls._get_canonical_head_hash(db)
             head_score = cls._get_score(db, previous_canonical_head)
         except CanonicalHeadNotFound:
-            return cls._set_as_canonical_chain_head(db, curr_chain_head.hash, genesis_parent_hash)
+            return cls._set_as_canonical_chain_head(db, curr_chain_head, genesis_parent_hash)
 
         if score > head_score:
-            return cls._set_as_canonical_chain_head(db, curr_chain_head.hash, genesis_parent_hash)
+            return cls._set_as_canonical_chain_head(db, curr_chain_head, genesis_parent_hash)
 
         return tuple(), tuple()
 
@@ -268,7 +244,7 @@ class HeaderDB(HeaderDatabaseAPI):
     def _set_as_canonical_chain_head(
         cls,
         db: DatabaseAPI,
-        block_hash: Hash32,
+        header: BlockHeaderAPI,
         genesis_parent_hash: Hash32,
     ) -> Tuple[Tuple[BlockHeaderAPI, ...], Tuple[BlockHeaderAPI, ...]]:
         """
@@ -279,14 +255,41 @@ class HeaderDB(HeaderDatabaseAPI):
             are no longer in the canonical chain
         """
         try:
-            header = cls._get_block_header_by_hash(db, block_hash)
-        except HeaderNotFound:
-            raise ValueError(
-                f"Cannot use unknown block hash as canonical head: {block_hash}"
+            current_canonical_head = cls._get_canonical_head_hash(db)
+        except CanonicalHeadNotFound:
+            current_canonical_head = None
+
+        new_canonical_headers: Tuple[BlockHeaderAPI, ...]
+        old_canonical_headers: Tuple[BlockHeaderAPI, ...]
+
+        if current_canonical_head and header.parent_hash == current_canonical_head:
+            # the calls to _find_new_ancestors and _decanonicalize_old_headers are
+            # relatively expensive, it's better to skip them in this case, where we're
+            # extending the canonical chain by a header
+            new_canonical_headers = (header,)
+            old_canonical_headers = ()
+        else:
+            new_canonical_headers = cast(
+                Tuple[BlockHeaderAPI, ...],
+                tuple(reversed(cls._find_new_ancestors(db, header, genesis_parent_hash)))
+            )
+            old_canonical_headers = cls._decanonicalize_old_headers(
+                db, new_canonical_headers
             )
 
-        new_canonical_headers = tuple(reversed(
-            cls._find_new_ancestors(db, header, genesis_parent_hash)))
+        for h in new_canonical_headers:
+            cls._add_block_number_to_hash_lookup(db, h)
+
+        db.set(SchemaV1.make_canonical_head_hash_lookup_key(), header.hash)
+
+        return new_canonical_headers, old_canonical_headers
+
+    @classmethod
+    def _decanonicalize_old_headers(
+        cls,
+        db: DatabaseAPI,
+        new_canonical_headers: Tuple[BlockHeaderAPI, ...]
+    ) -> Tuple[BlockHeaderAPI, ...]:
         old_canonical_headers = []
 
         for h in new_canonical_headers:
@@ -299,12 +302,7 @@ class HeaderDB(HeaderDatabaseAPI):
                 old_canonical_header = cls._get_block_header_by_hash(db, old_canonical_hash)
                 old_canonical_headers.append(old_canonical_header)
 
-        for h in new_canonical_headers:
-            cls._add_block_number_to_hash_lookup(db, h)
-
-        db.set(SchemaV1.make_canonical_head_hash_lookup_key(), header.hash)
-
-        return new_canonical_headers, tuple(old_canonical_headers)
+        return tuple(old_canonical_headers)
 
     @classmethod
     @to_tuple
