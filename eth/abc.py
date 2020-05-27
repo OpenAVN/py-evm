@@ -8,9 +8,11 @@ from typing import (
     ClassVar,
     ContextManager,
     Dict,
+    FrozenSet,
     Iterable,
     Iterator,
     MutableMapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -37,12 +39,15 @@ from eth_keys.datatypes import PrivateKey
 from eth.constants import (
     BLANK_ROOT_HASH,
 )
+
 from eth.exceptions import VMError
 from eth.typing import (
     BytesOrView,
+    ChainGaps,
     JournalDBCheckpoint,
     AccountState,
     HeaderParams,
+    VMConfiguration,
 )
 
 
@@ -333,10 +338,67 @@ class BlockAPI(rlp.Serializable, ABC):
         ...
 
 
+class MetaWitnessAPI(ABC):
+    @property
+    @abstractmethod
+    def hashes(self) -> FrozenSet[Hash32]:
+        ...
+
+    @property
+    @abstractmethod
+    def accounts_queried(self) -> FrozenSet[Address]:
+        ...
+
+    @property
+    @abstractmethod
+    def account_bytecodes_queried(self) -> FrozenSet[Address]:
+        ...
+
+    @abstractmethod
+    def get_slots_queried(self, address: Address) -> FrozenSet[int]:
+        ...
+
+    @property
+    @abstractmethod
+    def total_slots_queried(self) -> int:
+        """
+        Summed across all accounts, how many storage slots were queried?
+        """
+        ...
+
+
+class BlockAndMetaWitness(NamedTuple):
+    """
+    After evaluating a block using the VirtualMachine, this information
+    becomes available.
+    """
+    block: BlockAPI
+    meta_witness: MetaWitnessAPI
+
+
+class BlockImportResult(NamedTuple):
+    """
+    After importing and persisting a block into the active chain, this information
+    becomes available.
+    """
+    imported_block: BlockAPI
+    new_canonical_blocks: Tuple[BlockAPI, ...]
+    old_canonical_blocks: Tuple[BlockAPI, ...]
+    meta_witness: MetaWitnessAPI
+
+
 class SchemaAPI(ABC):
     """
     A class representing a database schema that maps values to lookup keys.
     """
+    @staticmethod
+    @abstractmethod
+    def make_header_chain_gaps_lookup_key() -> bytes:
+        """
+        Return the lookup key to retrieve the header chain integrity info from the database.
+        """
+        ...
+
     @staticmethod
     @abstractmethod
     def make_canonical_head_hash_lookup_key() -> bytes:
@@ -396,13 +458,24 @@ class DatabaseAPI(MutableMapping[bytes, bytes], ABC):
         ...
 
 
+class AtomicWriteBatchAPI(DatabaseAPI):
+    """
+    The readable/writeable object returned by an atomic database when we start building
+    a batch of writes to commit.
+
+    Reads to this database will observe writes written during batching,
+    but the writes will not actually persist until this object is committed.
+    """
+    pass
+
+
 class AtomicDatabaseAPI(DatabaseAPI):
     """
     Like ``BatchDB``, but immediately write out changes if they are
     not in an ``atomic_batch()`` context.
     """
     @abstractmethod
-    def atomic_batch(self) -> ContextManager[DatabaseAPI]:
+    def atomic_batch(self) -> ContextManager[AtomicWriteBatchAPI]:
         """
         Return a :class:`~typing.ContextManager` to write an atomic batch to the database.
         """
@@ -421,6 +494,19 @@ class HeaderDatabaseAPI(ABC):
         Instantiate the database from an :class:`~eth.abc.AtomicDatabaseAPI`.
         """
         ...
+
+    @abstractmethod
+    def get_header_chain_gaps(self) -> ChainGaps:
+        """
+        Return information about gaps in the chain of headers. This consists of an ordered sequence
+        of block ranges describing the integrity of the chain. Each block range describes a missing
+        segment in the chain and each range is defined with inclusive boundaries, meaning the first
+        value describes the first missing block of that segment and the second value describes the
+        last missing block of the segment.
+
+        In addition to the sequences of block ranges a block number is included that indicates the
+        number of the first header that is known to be missing at the very tip of the chain.
+        """
 
     #
     # Canonical Chain API
@@ -545,9 +631,34 @@ class ChainDatabaseAPI(HeaderDatabaseAPI):
             as genesis. Providing a ``genesis_parent_hash`` allows storage of blocks that
             aren't (yet) connected back to the true genesis header.
 
-        Assumes all block transactions have been persisted already.
+        .. warning::
+            This API assumes all block transactions have been persisted already. Use
+            :meth:`eth.abc.ChainDatabaseAPI.persist_unexecuted_block` to persist blocks that were
+            not executed.
         """
         ...
+
+    @abstractmethod
+    def persist_unexecuted_block(self,
+                                 block: BlockAPI,
+                                 receipts: Tuple[ReceiptAPI, ...],
+                                 genesis_parent_hash: Hash32 = None
+                                 ) -> Tuple[Tuple[Hash32, ...], Tuple[Hash32, ...]]:
+        """
+        Persist the given block's header, uncles, transactions, and receipts. Does
+        **not** validate if state transitions are valid.
+
+        :param block: the block that gets persisted
+        :param receipts: the receipts for the given block
+        :param genesis_parent_hash: *optional* parent hash of the header that is treated
+            as genesis. Providing a ``genesis_parent_hash`` allows storage of blocks that
+            aren't (yet) connected back to the true genesis header.
+
+        This API should be used to persist blocks that the EVM does not execute but which it
+        stores to make them available. It ensures to persist receipts and transactions which
+        :meth:`eth.abc.ChainDatabaseAPI.persist_block` in contrast assumes to be persisted
+        separately.
+        """
 
     @abstractmethod
     def persist_uncles(self, uncles: Tuple[BlockHeaderAPI]) -> Hash32:
@@ -1480,17 +1591,28 @@ class ComputationAPI(ContextManager['ComputationAPI'], StackManipulationAPI):
     #
     # State Transition
     #
+    @classmethod
     @abstractmethod
-    def apply_message(self) -> 'ComputationAPI':
+    def apply_message(
+            cls,
+            state: 'StateAPI',
+            message: MessageAPI,
+            transaction_context: TransactionContextAPI) -> 'ComputationAPI':
         """
-        Execution of a VM message.
+        Execute a VM message. This is where the VM-specific call logic exists.
         """
         ...
 
+    @classmethod
     @abstractmethod
-    def apply_create_message(self) -> 'ComputationAPI':
+    def apply_create_message(
+            cls,
+            state: 'StateAPI',
+            message: MessageAPI,
+            transaction_context: TransactionContextAPI) -> 'ComputationAPI':
         """
-        Execution of a VM message to create a new contract.
+        Execute a VM message to create a new contract. This is where the VM-specific
+        create logic exists.
         """
         ...
 
@@ -1501,7 +1623,14 @@ class ComputationAPI(ContextManager['ComputationAPI'], StackManipulationAPI):
                           message: MessageAPI,
                           transaction_context: TransactionContextAPI) -> 'ComputationAPI':
         """
-        Perform the computation that would be triggered by the VM message.
+        Execute the logic within the message: Either run the precompile, or
+        step through each opcode.  Generally, the only VM-specific logic is for
+        each opcode as it executes.
+
+        This should rarely be called directly, because it will skip over other important
+        VM-specific logic that happens before or after the execution.
+
+        Instead, prefer :meth:`~apply_message` or :meth:`~apply_create_message`.
         """
         ...
 
@@ -1610,6 +1739,13 @@ class AccountStorageDatabaseAPI(ABC):
     def persist(self, db: DatabaseAPI) -> None:
         """
         Persist all changes to the database.
+        """
+        ...
+
+    @abstractmethod
+    def get_accessed_slots(self) -> FrozenSet[int]:
+        """
+        List all the slots that had been accessed since object creation.
         """
         ...
 
@@ -1817,7 +1953,7 @@ class AccountDatabaseAPI(ABC):
         ...
 
     @abstractmethod
-    def persist(self) -> None:
+    def persist(self) -> MetaWitnessAPI:
         """
         Send changes to underlying database, including the trie state
         so that it will forever be possible to read the trie from this checkpoint.
@@ -2174,7 +2310,7 @@ class StateAPI(ConfigurableAPI):
         ...
 
     @abstractmethod
-    def persist(self) -> None:
+    def persist(self) -> MetaWitnessAPI:
         """
         Persist the current state to the database.
         """
@@ -2269,6 +2405,59 @@ class StateAPI(ConfigurableAPI):
         ...
 
 
+class ConsensusContextAPI(ABC):
+    """
+    A class representing a data context for the :class:`~eth.abc.ConsensusAPI` which is
+    instantiated once per chain instance and stays in memory across VM runs.
+    """
+
+    @abstractmethod
+    def __init__(self, db: AtomicDatabaseAPI) -> None:
+        """
+        Initialize the context with a database.
+        """
+        ...
+
+
+class ConsensusAPI(ABC):
+    """
+    A class encapsulating the consensus scheme to allow chains to run under different kind of
+    EVM-compatible consensus mechanisms such as the Clique Proof of Authority scheme.
+    """
+
+    @abstractmethod
+    def __init__(self, context: ConsensusContextAPI) -> None:
+        """
+        Initialize the consensus api.
+        """
+        ...
+
+    @abstractmethod
+    def validate_seal(self, header: BlockHeaderAPI) -> None:
+        """
+        Validate the seal on the given header, even if its parent is missing.
+        """
+        ...
+
+    @abstractmethod
+    def validate_seal_extension(self,
+                                header: BlockHeaderAPI,
+                                parents: Iterable[BlockHeaderAPI]) -> None:
+        """
+        Validate the seal on the given header when all parents must be present. Parent headers
+        that are not yet in the database must be passed as ``parents``.
+        """
+        ...
+
+    @classmethod
+    @abstractmethod
+    def get_fee_recipient(cls, header: BlockHeaderAPI) -> Address:
+        """
+        Return the address that should receive rewards for creating the block.
+        """
+        ...
+
+
 class VirtualMachineAPI(ConfigurableAPI):
     """
     The :class:`~eth.abc.VirtualMachineAPI` class represents the Chain rules for a
@@ -2285,9 +2474,14 @@ class VirtualMachineAPI(ConfigurableAPI):
     fork: str  # noqa: E701  # flake8 bug that's fixed in 3.6.0+
     chaindb: ChainDatabaseAPI
     extra_data_max_bytes: ClassVar[int]
+    consensus_class: Type[ConsensusAPI]
+    consensus_context: ConsensusContextAPI
 
     @abstractmethod
-    def __init__(self, header: BlockHeaderAPI, chaindb: ChainDatabaseAPI) -> None:
+    def __init__(self,
+                 header: BlockHeaderAPI,
+                 chaindb: ChainDatabaseAPI,
+                 consensus_context: ConsensusContextAPI) -> None:
         """
         Initialize the virtual machine.
         """
@@ -2372,7 +2566,17 @@ class VirtualMachineAPI(ConfigurableAPI):
                          code_address: Address = None) -> ComputationAPI:
         """
         Execute raw bytecode in the context of the current state of
-        the virtual machine.
+        the virtual machine. Note that this skips over some of the logic
+        that would normally happen during a call. Watch out for:
+
+            - value (ether) is *not* transferred
+            - state is *not* rolled back in case of an error
+            - The target account is *not* necessarily created
+            - others...
+
+        For other potential surprises, check the implementation differences
+        between :meth:`ComputationAPI.apply_computation` and
+        :meth:`ComputationAPI.apply_message`. (depending on the VM fork)
         """
         ...
 
@@ -2414,14 +2618,14 @@ class VirtualMachineAPI(ConfigurableAPI):
     # Mining
     #
     @abstractmethod
-    def import_block(self, block: BlockAPI) -> BlockAPI:
+    def import_block(self, block: BlockAPI) -> BlockAndMetaWitness:
         """
         Import the given block to the chain.
         """
         ...
 
     @abstractmethod
-    def mine_block(self, *args: Any, **kwargs: Any) -> BlockAPI:
+    def mine_block(self, *args: Any, **kwargs: Any) -> BlockAndMetaWitness:
         """
         Mine the current block. Proxies to self.pack_block method.
         """
@@ -2442,7 +2646,7 @@ class VirtualMachineAPI(ConfigurableAPI):
     # Finalization
     #
     @abstractmethod
-    def finalize_block(self, block: BlockAPI) -> BlockAPI:
+    def finalize_block(self, block: BlockAPI) -> BlockAndMetaWitness:
         """
         Perform any finalization steps like awarding the block mining reward,
         and persisting the final state root.
@@ -2639,11 +2843,9 @@ class VirtualMachineAPI(ConfigurableAPI):
 
     @classmethod
     @abstractmethod
-    def validate_header(cls,
+    def validate_header(self,
                         header: BlockHeaderAPI,
-                        parent_header: BlockHeaderAPI,
-                        check_seal: bool = True
-                        ) -> None:
+                        parent_header: BlockHeaderAPI) -> None:
         """
         :raise eth.exceptions.ValidationError: if the header is not valid
         """
@@ -2663,11 +2865,20 @@ class VirtualMachineAPI(ConfigurableAPI):
         """
         ...
 
-    @classmethod
     @abstractmethod
-    def validate_seal(cls, header: BlockHeaderAPI) -> None:
+    def validate_seal(self, header: BlockHeaderAPI) -> None:
         """
         Validate the seal on the given header.
+        """
+        ...
+
+    @abstractmethod
+    def validate_seal_extension(self,
+                                header: BlockHeaderAPI,
+                                parents: Iterable[BlockHeaderAPI]) -> None:
+        """
+        Validate the seal on the given header when all parents must be present. Parent headers
+        that are not yet in the database must be passed as ``parents``.
         """
         ...
 
@@ -2699,6 +2910,20 @@ class VirtualMachineAPI(ConfigurableAPI):
         """
         Return a :class:`~typing.ContextManager` with the current state wrapped in a temporary
         block.
+        """
+        ...
+
+
+class VirtualMachineModifierAPI(ABC):
+    """
+    Amend a set of VMs for a chain. This allows modifying a chain for different consensus schemes.
+    """
+
+    @abstractmethod
+    def amend_vm_configuration(self, vm_config: VMConfiguration) -> VMConfiguration:
+        """
+        Amend the ``vm_config`` by configuring the VM classes, and hence returning a modified
+        set of VM classes.
         """
         ...
 
@@ -2814,6 +3039,7 @@ class ChainAPI(ConfigurableAPI):
     vm_configuration: Tuple[Tuple[BlockNumber, Type[VirtualMachineAPI]], ...]
     chain_id: int
     chaindb: ChainDatabaseAPI
+    consensus_context_class: Type[ConsensusContextAPI]
 
     #
     # Helpers
@@ -3101,7 +3327,7 @@ class ChainAPI(ConfigurableAPI):
     def import_block(self,
                      block: BlockAPI,
                      perform_validation: bool=True,
-                     ) -> Tuple[BlockAPI, Tuple[BlockAPI, ...], Tuple[BlockAPI, ...]]:
+                     ) -> BlockImportResult:
         """
         Import the given ``block`` and return a 3-tuple
 
@@ -3155,10 +3381,9 @@ class ChainAPI(ConfigurableAPI):
         """
         ...
 
-    @classmethod
     @abstractmethod
     def validate_chain(
-            cls,
+            self,
             root: BlockHeaderAPI,
             descendants: Tuple[BlockHeaderAPI, ...],
             seal_check_random_sample_rate: int = 1) -> None:
@@ -3168,6 +3393,17 @@ class ChainAPI(ConfigurableAPI):
         By default, check the seal validity (Proof-of-Work on Ethereum 1.x mainnet) of all headers.
         This can be expensive. Instead, check a random sample of seals using
         seal_check_random_sample_rate.
+        """
+        ...
+
+    @abstractmethod
+    def validate_chain_extension(self, headers: Tuple[BlockHeaderAPI, ...]) -> None:
+        """
+        Validate a chain of headers under the assumption that the entire chain of headers is
+        present. Headers that are not already in the database must exist in ``headers``. Calling
+        this API is not a replacement for calling :meth:`~eth.abc.ChainAPI.validate_chain`, it is
+        an additional API to call at a different stage of header processing to enable consensus
+        schemes where the consensus can not be verified out of order.
         """
         ...
 
@@ -3202,5 +3438,13 @@ class MiningChainAPI(ChainAPI):
         """
         Mines the current block. Proxies to the current Virtual Machine.
         See VM. :meth:`~eth.vm.base.VM.mine_block`
+        """
+        ...
+
+    @abstractmethod
+    def mine_block_extended(self, *args: Any, **kwargs: Any) -> BlockAndMetaWitness:
+        """
+        Just like :meth:`~mine_block`, but includes extra returned info. Currently,
+        the only extra info returned is the :class:`MetaWitness`.
         """
         ...

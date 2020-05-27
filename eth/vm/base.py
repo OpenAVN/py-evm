@@ -8,13 +8,13 @@ from typing import (
     Iterator,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
     Union,
 )
 
-from typing import Set
-
+from cached_property import cached_property
 from eth_hash.auto import keccak
 from eth_typing import (
     Address,
@@ -28,10 +28,13 @@ import rlp
 from eth.abc import (
     AtomicDatabaseAPI,
     BlockAPI,
+    BlockAndMetaWitness,
     BlockHeaderAPI,
     ChainContextAPI,
     ChainDatabaseAPI,
     ComputationAPI,
+    ConsensusAPI,
+    ConsensusContextAPI,
     ExecutionContextAPI,
     ReceiptAPI,
     SignedTransactionAPI,
@@ -40,7 +43,7 @@ from eth.abc import (
     VirtualMachineAPI,
 )
 from eth.consensus.pow import (
-    check_pow,
+    PowConsensus,
 )
 from eth.constants import (
     GENESIS_PARENT_HASH,
@@ -84,6 +87,7 @@ from eth.vm.message import (
 
 class VM(Configurable, VirtualMachineAPI):
     block_class: Type[BlockAPI] = None
+    consensus_class: Type[ConsensusAPI] = PowConsensus
     extra_data_max_bytes: ClassVar[int] = 32
     fork: str = None  # noqa: E701  # flake8 bug that's fixed in 3.6.0+
     chaindb: ChainDatabaseAPI = None
@@ -97,9 +101,11 @@ class VM(Configurable, VirtualMachineAPI):
     def __init__(self,
                  header: BlockHeaderAPI,
                  chaindb: ChainDatabaseAPI,
-                 chain_context: ChainContextAPI) -> None:
+                 chain_context: ChainContextAPI,
+                 consensus_context: ConsensusContextAPI) -> None:
         self.chaindb = chaindb
         self.chain_context = chain_context
+        self.consensus_context = consensus_context
         self._initial_header = header
 
     def get_header(self) -> BlockHeaderAPI:
@@ -133,6 +139,10 @@ class VM(Configurable, VirtualMachineAPI):
         execution_context = cls.create_execution_context(header, previous_hashes, chain_context)
         return cls.get_state_class()(db, execution_context, header.state_root)
 
+    @cached_property
+    def _consensus(self) -> ConsensusAPI:
+        return self.consensus_class(self.consensus_context)
+
     #
     # Logging
     #
@@ -158,12 +168,14 @@ class VM(Configurable, VirtualMachineAPI):
 
         return receipt, computation
 
-    @staticmethod
-    def create_execution_context(header: BlockHeaderAPI,
+    @classmethod
+    def create_execution_context(cls,
+                                 header: BlockHeaderAPI,
                                  prev_hashes: Iterable[Hash32],
                                  chain_context: ChainContextAPI) -> ExecutionContextAPI:
+        fee_recipient = cls.consensus_class.get_fee_recipient(header)
         return ExecutionContext(
-            coinbase=header.coinbase,
+            coinbase=fee_recipient,
             timestamp=header.timestamp,
             block_number=header.block_number,
             difficulty=header.difficulty,
@@ -204,7 +216,7 @@ class VM(Configurable, VirtualMachineAPI):
         )
 
         # Execute it in the VM
-        return self.state.get_computation(message, transaction_context).apply_computation(
+        return self.state.computation_class.apply_computation(
             self.state,
             message,
             transaction_context,
@@ -250,7 +262,7 @@ class VM(Configurable, VirtualMachineAPI):
     #
     # Mining
     #
-    def import_block(self, block: BlockAPI) -> BlockAPI:
+    def import_block(self, block: BlockAPI) -> BlockAndMetaWitness:
         if self.get_block().number != block.number:
             raise ValidationError(
                 f"This VM can only import blocks at number #{self.get_block().number},"
@@ -290,15 +302,15 @@ class VM(Configurable, VirtualMachineAPI):
 
         return self.mine_block()
 
-    def mine_block(self, *args: Any, **kwargs: Any) -> BlockAPI:
+    def mine_block(self, *args: Any, **kwargs: Any) -> BlockAndMetaWitness:
         packed_block = self.pack_block(self.get_block(), *args, **kwargs)
 
-        final_block = self.finalize_block(packed_block)
+        block_result = self.finalize_block(packed_block)
 
         # Perform validation
-        self.validate_block(final_block)
+        self.validate_block(block_result.block)
 
-        return final_block
+        return block_result
 
     def set_block_transactions(self,
                                base_block: BlockAPI,
@@ -328,23 +340,30 @@ class VM(Configurable, VirtualMachineAPI):
             len(block.uncles) * self.get_nephew_reward()
         )
 
-        self.state.delta_balance(block.header.coinbase, block_reward)
-        self.logger.debug(
-            "BLOCK REWARD: %s -> %s",
-            block_reward,
-            block.header.coinbase,
-        )
+        if block_reward != 0:
+            self.state.delta_balance(block.header.coinbase, block_reward)
+            self.logger.debug(
+                "BLOCK REWARD: %s -> %s",
+                block_reward,
+                block.header.coinbase,
+            )
+        else:
+            self.logger.debug("No block reward given to %s", block.header.coinbase)
 
         for uncle in block.uncles:
             uncle_reward = self.get_uncle_reward(block.number, uncle)
-            self.state.delta_balance(uncle.coinbase, uncle_reward)
-            self.logger.debug(
-                "UNCLE REWARD REWARD: %s -> %s",
-                uncle_reward,
-                uncle.coinbase,
-            )
 
-    def finalize_block(self, block: BlockAPI) -> BlockAPI:
+            if uncle_reward != 0:
+                self.state.delta_balance(uncle.coinbase, uncle_reward)
+                self.logger.debug(
+                    "UNCLE REWARD REWARD: %s -> %s",
+                    uncle_reward,
+                    uncle.coinbase,
+                )
+            else:
+                self.logger.debug("No uncle reward given to %s", uncle.coinbase)
+
+    def finalize_block(self, block: BlockAPI) -> BlockAndMetaWitness:
         if block.number > 0:
             snapshot = self.state.snapshot()
             try:
@@ -357,9 +376,20 @@ class VM(Configurable, VirtualMachineAPI):
 
         # We need to call `persist` here since the state db batches
         # all writes until we tell it to write to the underlying db
-        self.state.persist()
+        meta_witness = self.state.persist()
 
-        return block.copy(header=block.header.copy(state_root=self.state.state_root))
+        final_block = block.copy(header=block.header.copy(state_root=self.state.state_root))
+
+        self.logger.debug(
+            "%s reads %d unique node hashes, %d addresses, %d bytecodes, and %d storage slots",
+            final_block,
+            len(meta_witness.hashes),
+            len(meta_witness.accounts_queried),
+            len(meta_witness.account_bytecodes_queried),
+            meta_witness.total_slots_queried,
+        )
+
+        return BlockAndMetaWitness(final_block, meta_witness)
 
     def pack_block(self, block: BlockAPI, *args: Any, **kwargs: Any) -> BlockAPI:
         if 'uncles' in kwargs:
@@ -533,8 +563,8 @@ class VM(Configurable, VirtualMachineAPI):
     @classmethod
     def validate_header(cls,
                         header: BlockHeaderAPI,
-                        parent_header: BlockHeaderAPI,
-                        check_seal: bool = True) -> None:
+                        parent_header: BlockHeaderAPI) -> None:
+
         if parent_header is None:
             # to validate genesis header, check if it equals canonical header at block number 0
             raise ValidationError("Must have access to parent header to validate current header")
@@ -560,21 +590,21 @@ class VM(Configurable, VirtualMachineAPI):
                     f"- parent : {parent_header.timestamp}. "
                 )
 
-            if check_seal:
-                try:
-                    cls.validate_seal(header)
-                except ValidationError:
-                    cls.cls_logger.warning(
-                        "Failed to validate header proof of work on header: %r",
-                        header.as_dict()
-                    )
-                    raise
+    def validate_seal(self, header: BlockHeaderAPI) -> None:
+        try:
+            self._consensus.validate_seal(header)
+        except ValidationError as exc:
+            self.cls_logger.debug(
+                "Failed to validate seal on header: %r. Error: %s",
+                header.as_dict(),
+                exc,
+            )
+            raise
 
-    @classmethod
-    def validate_seal(cls, header: BlockHeaderAPI) -> None:
-        check_pow(
-            header.block_number, header.mining_hash,
-            header.mix_hash, header.nonce, header.difficulty)
+    def validate_seal_extension(self,
+                                header: BlockHeaderAPI,
+                                parents: Iterable[BlockHeaderAPI]) -> None:
+        self._consensus.validate_seal_extension(header, parents)
 
     @classmethod
     def validate_uncle(cls, block: BlockAPI, uncle: BlockAPI, uncle_parent: BlockAPI) -> None:

@@ -15,6 +15,7 @@ from eth import (
 from eth._utils.address import (
     force_bytes_to_address,
 )
+from eth.consensus import ConsensusContext
 from eth.db.atomic import (
     AtomicDB
 )
@@ -98,7 +99,8 @@ def setup_computation(
         origin=CANONICAL_ADDRESS_B,
     )
 
-    vm = vm_class(GENESIS_HEADER, ChainDB(AtomicDB()), chain_context)
+    db = AtomicDB()
+    vm = vm_class(GENESIS_HEADER, ChainDB(db), chain_context, ConsensusContext(db))
 
     computation = vm_class._state_class.computation_class(
         state=vm.state,
@@ -826,7 +828,11 @@ def test_sstore(vm_class, code, gas_used, refund, original):
     assert computation.state.get_storage(CANONICAL_ADDRESS_B, 0, from_journal=True) == original
     assert computation.state.get_storage(CANONICAL_ADDRESS_B, 0, from_journal=False) == original
 
-    comp = computation.apply_message()
+    comp = computation.apply_message(
+        computation.state,
+        computation.msg,
+        computation.transaction_context,
+    )
     assert comp.get_gas_refund() == refund
     assert comp.get_gas_used() == gas_used
 
@@ -856,7 +862,11 @@ def test_sstore_limit_2300(gas_supplied, success, gas_used, refund):
     assert computation.state.get_storage(CANONICAL_ADDRESS_B, 0) == original
     computation.state.persist()
 
-    comp = computation.apply_message()
+    comp = computation.apply_message(
+        computation.state,
+        computation.msg,
+        computation.transaction_context,
+    )
     if success and not comp.is_success:
         raise comp._error
     else:
@@ -961,7 +971,11 @@ def test_balance(vm_class, code, expect_exception, expect_gas_used):
     computation.state.set_balance(CANONICAL_ADDRESS_B, sender_balance)
     computation.state.persist()
 
-    comp = computation.apply_message()
+    comp = computation.apply_message(
+        computation.state,
+        computation.msg,
+        computation.transaction_context,
+    )
     if expect_exception:
         assert isinstance(comp.error, expect_exception)
     else:
@@ -1015,7 +1029,11 @@ def test_balance(vm_class, code, expect_exception, expect_gas_used):
 )
 def test_gas_costs(vm_class, code, expect_gas_used):
     computation = setup_computation(vm_class, CANONICAL_ADDRESS_B, code)
-    comp = computation.apply_message()
+    comp = computation.apply_message(
+        computation.state,
+        computation.msg,
+        computation.transaction_context,
+    )
     assert comp.is_success
     assert comp.get_gas_used() == expect_gas_used
 
@@ -1096,7 +1114,11 @@ def test_blake2b_f_compression(vm_class, input_hex, output_hex, expect_exception
         data=to_bytes(hexstr=input_hex),
     )
 
-    comp = computation.apply_message()
+    comp = computation.apply_message(
+        computation.state,
+        computation.msg,
+        computation.transaction_context,
+    )
     if expect_exception:
         assert isinstance(comp.error, expect_exception)
     else:

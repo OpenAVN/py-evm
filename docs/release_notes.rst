@@ -3,6 +3,93 @@ Release notes
 
 .. towncrier release notes start
 
+py-evm 0.3.0-alpha.15 (2020-04-14)
+----------------------------------
+
+Features
+~~~~~~~~
+
+- :meth:`eth.chains.base.Chain.import_block()` now returns some meta-information about the witness.
+  You can get a list of trie node hashes needed to build the witness, as well
+  as the accesses of accounts, storage slots, and bytecodes. (`#1917
+  <https://github.com/ethereum/py-evm/issues/1917>`__)
+
+
+Internal Changes - for Contributors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Use a more recent eth-keys, which calls an eth-typing that's not deprecated. (`#1665 <https://github.com/ethereum/py-evm/issues/1665>`__)
+- Upgrade pytest-xdist from 1.18.1 to 1.31.0, to fix a CI crash. (`#1917 <https://github.com/ethereum/py-evm/issues/1917>`__)
+- Added :class:`~eth.db.accesslog.KeyAccessLoggerDB` and its atomic twin; faster ``make
+  validate-docs`` (but you have to remember to ``pip install -e .[doc]`` yourself); ``str(block)`` now
+  includes some bytes of the block hash. (`#1918 <https://github.com/ethereum/py-evm/issues/1918>`__)
+- Fix for creating a duplicate "ghost" Computation that was never used. It didn't
+  break anything, but was inelegant and surprising to get extra objects created
+  that were mostly useless. This was achieved by changing
+  :meth:`eth.abc.ComputationAPI.apply_message` and
+  :meth:`eth.abc.ComputationAPI.apply_create_message` to be class methods. (`#1921 <https://github.com/ethereum/py-evm/issues/1921>`__)
+
+
+py-evm 0.3.0-alpha.14 (2020-02-10)
+----------------------------------
+
+Features
+~~~~~~~~
+
+- Change return type for ``import_block`` from ``Tuple[BlockAPI, Tuple[BlockAPI, ...], Tuple[BlockAPI, ...]]`` to ``BlockImportResult`` (NamedTuple). (`#1910 <https://github.com/ethereum/py-evm/issues/1910>`__)
+
+
+Bugfixes
+~~~~~~~~
+
+- Fixed a consensus-critical bug for contracts that are created and destroyed in the same block,
+  especially pre-Byzantium. (`#1912 <https://github.com/ethereum/py-evm/issues/1912>`__)
+
+
+Internal Changes - for Contributors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Add explicit tests for ``validate_header`` (`#1911 <https://github.com/ethereum/py-evm/issues/1911>`__)
+
+
+py-evm 0.3.0-alpha.13 (2020-01-13)
+----------------------------------
+
+Features
+~~~~~~~~
+
+- Make handling of different consensus mechanisms more flexible and sound.
+
+  1. ``validate_seal`` and ``validate_header`` are now instance methods. The only reason they can
+  be classmethods today is because our Pow implementation relies on a globally shared cache
+  which should be refactored to use the ``ConsensusContextAPI``.
+
+  2. There a two new methods: ``chain.validate_chain_extension(header, parents)`` and
+  ``vm.validate_seal_extension``. They perform extension seal checks to support consensus schemes
+  where headers can not be checked if parents are missing.
+
+  3. The consensus mechanism is now abstracted via ``ConsensusAPI`` and ``ConsensusContextAPI``.
+  VMs instantiate a consensus api based on the set ``consensus_class`` and pass it a context which
+  they receive from the chain upon instantiation. The chain instantiates the consensus context api
+  based on the ``consensus_context_class``. (`#1899 <https://github.com/ethereum/py-evm/issues/1899>`__)
+- Support Istanbul fork in ``GOERLI_VM_CONFIGURATION`` (`#1904 <https://github.com/ethereum/py-evm/issues/1904>`__)
+
+
+Bugfixes
+~~~~~~~~
+
+- Do not mention PoW in the logging message that we log when `validate_seal` fails.
+  The VM could also be running under a non-PoW consensus mechanism. (`#1907 <https://github.com/ethereum/py-evm/issues/1907>`__)
+
+
+Deprecations and Removals
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Drop optional ``check_seal`` param from ``VM.validate_header`` and turn it into a ``classmethod``.
+  Seal checks now need to be made explicitly via ``VM.check_seal`` which is also aligned
+  with ``VM.check_seal_extension``. (`#1909 <https://github.com/ethereum/py-evm/issues/1909>`__)
+
+
 py-evm 0.3.0-alpha.12 (2019-12-19)
 ----------------------------------
 

@@ -41,6 +41,15 @@ AccountState = Dict[Address, AccountDetails]
 
 AccountDiff = Iterable[Tuple[Address, str, Union[int, bytes], Union[int, bytes]]]
 
+BlockRange = Tuple[BlockNumber, BlockNumber]
+
+ChainGaps = Tuple[
+    # series of gaps before the chain head
+    Tuple[BlockRange, ...],
+    # the first missing block number at the tip of the chain
+    BlockNumber,
+]
+
 GeneralState = Union[
     AccountState,
     List[Tuple[Address, Dict[str, Union[int, bytes, Dict[int, int]]]]]

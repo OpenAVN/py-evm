@@ -8,7 +8,7 @@ deps = {
         "blake2b-py>=0.1.2,<0.2",
         "cached-property>=1.5.1,<2",
         "eth-bloom>=1.0.3,<2.0.0",
-        "eth-keys>=0.2.1,<0.3.0",
+        "eth-keys>=0.2.1,<0.4.0",
         "eth-typing>=2.2.0,<3.0.0",
         "eth-utils>=1.7.0,<2.0.0",
         "lru-dict>=1.1.6",
@@ -30,13 +30,13 @@ deps = {
     ],
     'test': [
         "factory-boy==2.11.1",
-        "hypothesis==3.69.5",
+        "hypothesis>=5,<6",
         "pexpect>=4.6, <5",
         "pytest>=5.1.3,<6",
         "pytest-asyncio>=0.10.0,<0.11",
         "pytest-cov==2.5.1",
         "pytest-watch>=4.1.0,<5",
-        "pytest-xdist==1.18.1",
+        "pytest-xdist==1.31.0",
     ],
     'lint': [
         "flake8==3.5.0",
@@ -51,7 +51,6 @@ deps = {
         "py-evm>=0.2.0-alpha.14",
         # We need to have pysha for autodoc to be able to extract API docs
         "pysha3>=1.0.0,<2.0.0",
-        "pytest~=3.2",
         # Sphinx pined to `<1.8.0`: https://github.com/sphinx-doc/sphinx/issues/3494
         "Sphinx>=1.5.5,<1.8.0",
         "sphinx_rtd_theme>=0.1.9",
@@ -92,7 +91,7 @@ with open('README.md') as readme_file:
 setup(
     name='py-evm',
     # *IMPORTANT*: Don't manually change the version here. Use the 'bumpversion' utility.
-    version='0.3.0-alpha.12',
+    version='0.3.0-alpha.15',
     description='Python implementation of the Ethereum Virtual Machine',
     long_description=long_description,
     long_description_content_type='text/markdown',

@@ -29,6 +29,13 @@ from eth.abc import (
 from eth.constants import (
     GENESIS_PARENT_HASH,
 )
+from eth.db.chain_gaps import (
+    calculate_gaps,
+    GapChange,
+    GapInfo,
+    GAP_WRITES,
+    GENESIS_CHAIN_GAPS,
+)
 from eth.exceptions import (
     CanonicalHeadNotFound,
     HeaderNotFound,
@@ -36,6 +43,8 @@ from eth.exceptions import (
 )
 from eth.db.schema import SchemaV1
 from eth.rlp.headers import BlockHeader
+from eth.rlp.sedes import chain_gaps
+from eth.typing import ChainGaps
 from eth.validation import (
     validate_block_number,
     validate_word,
@@ -45,6 +54,40 @@ from eth.validation import (
 class HeaderDB(HeaderDatabaseAPI):
     def __init__(self, db: AtomicDatabaseAPI) -> None:
         self.db = db
+
+    def get_header_chain_gaps(self) -> ChainGaps:
+        return self._get_header_chain_gaps(self.db)
+
+    @classmethod
+    def _get_header_chain_gaps(cls, db: DatabaseAPI) -> ChainGaps:
+        try:
+            encoded_gaps = db[SchemaV1.make_header_chain_gaps_lookup_key()]
+        except KeyError:
+            return GENESIS_CHAIN_GAPS
+        else:
+            return rlp.decode(encoded_gaps, sedes=chain_gaps)
+
+    @classmethod
+    def _update_header_chain_gaps(
+            cls,
+            db: DatabaseAPI,
+            persisted_header: BlockHeaderAPI,
+            base_gaps: ChainGaps = None) -> GapInfo:
+
+            # If we make many updates in a row, we can avoid reloading the integrity info by
+            # continuously caching it and providing it as a parameter to this API
+            if base_gaps is None:
+                base_gaps = cls._get_header_chain_gaps(db)
+
+            gap_change, gaps = calculate_gaps(persisted_header.block_number, base_gaps)
+
+            if gap_change is not GapChange.NoChange:
+                db.set(
+                    SchemaV1.make_header_chain_gaps_lookup_key(),
+                    rlp.encode(gaps, sedes=chain_gaps)
+                )
+
+            return gap_change, gaps
 
     #
     # Canonical Chain API
@@ -178,6 +221,7 @@ class HeaderDB(HeaderDatabaseAPI):
         previous_score = score - header.difficulty
         cls._set_hash_scores_to_db(db, header, previous_score)
         cls._set_as_canonical_chain_head(db, header, header.parent_hash)
+        cls._update_header_chain_gaps(db, header)
 
     @classmethod
     def _persist_header_chain(
@@ -211,6 +255,8 @@ class HeaderDB(HeaderDatabaseAPI):
             rlp.encode(curr_chain_head),
         )
         score = cls._set_hash_scores_to_db(db, curr_chain_head, score)
+        gap_change, gaps = cls._update_header_chain_gaps(db, curr_chain_head)
+        cls._handle_gap_change(db, gap_change, curr_chain_head, genesis_parent_hash)
 
         orig_headers_seq = concat([(first_header,), headers_iterator])
         for parent, child in sliding_window(2, orig_headers_seq):
@@ -228,7 +274,8 @@ class HeaderDB(HeaderDatabaseAPI):
             )
 
             score = cls._set_hash_scores_to_db(db, curr_chain_head, score)
-
+            gap_change, gaps = cls._update_header_chain_gaps(db, curr_chain_head, gaps)
+            cls._handle_gap_change(db, gap_change, curr_chain_head, genesis_parent_hash)
         try:
             previous_canonical_head = cls._get_canonical_head_hash(db)
             head_score = cls._get_score(db, previous_canonical_head)
@@ -239,6 +286,32 @@ class HeaderDB(HeaderDatabaseAPI):
             return cls._set_as_canonical_chain_head(db, curr_chain_head, genesis_parent_hash)
 
         return tuple(), tuple()
+
+    @classmethod
+    def _handle_gap_change(cls,
+                           db: DatabaseAPI,
+                           gap_change: GapChange,
+                           header: BlockHeaderAPI,
+                           genesis_parent_hash: Hash32) -> None:
+
+        if gap_change not in GAP_WRITES:
+            return
+
+        if gap_change is GapChange.GapFill:
+            next_child_number = BlockNumber(header.block_number + 1)
+            expected_child = cls._get_canonical_block_header_by_number(db, next_child_number)
+            if header.hash != expected_child.parent_hash:
+                # We are trying to close a gap with an uncle. Reject!
+                raise ValidationError(f"{header} is not the parent of {expected_child}")
+
+        # We implicitly assert that persisted headers are canonical here.
+        # This assertion is made when persisting headers that are known to be part of a gap
+        # in the canonical chain.
+        # What if this assertion is later found to be false? At gap fill time, we can detect if the
+        # chains don't link (and raise a ValidationError). Also, when a true canonical header is
+        # added eventually, we need to canonicalize all the true headers.
+        for ancestor in cls._find_new_ancestors(db, header, genesis_parent_hash):
+            cls._add_block_number_to_hash_lookup(db, ancestor)
 
     @classmethod
     def _set_as_canonical_chain_head(
